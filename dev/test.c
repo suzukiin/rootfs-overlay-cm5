@@ -54,7 +54,7 @@ void init_snmp_session(const char *ip) {
     session.version = SNMP_VERSION_2c;
     session.community = (u_char *)"public";
     session.community_len = strlen((const char *)session.community);
-    session.timeout = 1500000; // 1.5 segundos
+    session.timeout = 1500000; 
     session.retries = 1;
 
     ss = snmp_open(&session);
@@ -81,7 +81,6 @@ int get_snmp_int(const char *oid_str) {
     if (status == STAT_SUCCESS && response != NULL) {
         if (response->errstat == SNMP_ERR_NOERROR && response->variables != NULL) {
             u_char type = response->variables->type;
-            // R&S pode retornar Integers ou Gauges para temperatura/potência
             if (type == ASN_INTEGER || type == ASN_GAUGE || type == ASN_COUNTER || type == ASN_TIMETICKS) {
                 val = (int)*response->variables->val.integer;
             } else {
@@ -113,7 +112,6 @@ int discover_amplifiers(const char *base_oid_str, int *found_ids) {
         if (status == STAT_SUCCESS && response && response->errstat == SNMP_ERR_NOERROR) {
             struct variable_list *vars = response->variables;
             if (vars && snmp_oid_compare(root_oid, root_oid_len, vars->name, root_oid_len) == 0) {
-                // Pega o ID (normalmente o último dígito)
                 int id = vars->name[vars->name_length - 1];
                 found_ids[count++] = id;
                 memcpy(current_oid, vars->name, vars->name_length * sizeof(oid));
@@ -131,7 +129,7 @@ int discover_amplifiers(const char *base_oid_str, int *found_ids) {
     return count;
 }
 
-// --- MÉTRICAS GLOBAIS (POTÊNCIA TOTAL) ---
+// --- MÉTRICAS GLOBAIS (COM CORREÇÃO DE ÍNDICE) ---
 void process_globals(cJSON *root) {
     cJSON *globals = cJSON_GetObjectItem(root, "global_metrics");
     cJSON *metric = NULL;
@@ -139,10 +137,24 @@ void process_globals(cJSON *root) {
     printf("\n>>> MÉTRICAS GLOBAIS DO TRANSMISSOR\n");
     cJSON_ArrayForEach(metric, globals) {
         const char *name = cJSON_GetObjectItem(metric, "name")->valuestring;
-        const char *oid = cJSON_GetObjectItem(metric, "oid")->valuestring;
+        const char *oid_base = cJSON_GetObjectItem(metric, "oid")->valuestring;
         
-        int val = get_snmp_int(oid);
-        printf("  %-18s: %d\n", name, val);
+        // Tenta a OID do JSON (normalmente termina em .0)
+        int val = get_snmp_int(oid_base);
+        
+        // Se falhar, tenta o índice de rack .1.1.1 (Comum na R&S)
+        if (val < 0) {
+            char alt_oid[256];
+            // Remove o .0 final e tenta .1.1.1
+            char temp_oid[256];
+            strncpy(temp_oid, oid_base, strlen(oid_base) - 2);
+            temp_oid[strlen(oid_base) - 2] = '\0';
+            snprintf(alt_oid, sizeof(alt_oid), "%s.1.1.1", temp_oid);
+            val = get_snmp_int(alt_oid);
+        }
+
+        if (val >= 0) printf("  %-18s: %d W\n", name, val);
+        else printf("  %-18s: ERRO DE LEITURA (%d)\n", name, val);
     }
 }
 
@@ -157,20 +169,18 @@ void process_amplifier(int amp_id, cJSON *amp_table) {
     printf(" ANALISANDO GAVETA ID: %d\n", amp_id);
     printf("======================================\n");
 
-    // 1. Leitura de Temperatura (Ajustada com prefixo .1.1 para bater com a tabela)
+    // 1. Leitura de Temperatura com Escala Decimal
     char temp_oid_full[256];
     snprintf(temp_oid_full, sizeof(temp_oid_full), "%s.1.1.%d", base_temp_oid, amp_id);
-    int temp = get_snmp_int(temp_oid_full);
+    int temp_raw = get_snmp_int(temp_oid_full);
     
-    if (temp < 0) {
-        // Tenta o formato simples caso o .1.1 falhe
-        snprintf(temp_oid_full, sizeof(temp_oid_full), "%s.%d", base_temp_oid, amp_id);
-        temp = get_snmp_int(temp_oid_full);
+    if (temp_raw >= 0) {
+        printf("  [MEDIDA] Temperatura: %.1f C\n", temp_raw / 10.0);
+    } else {
+        printf("  [MEDIDA] Temperatura: ERRO (%d)\n", temp_raw);
     }
-    
-    printf("  [MEDIDA] Temperatura: %d C\n", temp);
 
-    // 2. Leitura de Alertas (Padrão que funcionou: BASE.1.1.ID.CODE)
+    // 2. Leitura de Alertas
     printf("  [STATUS] Verificando Alertas...\n");
     cJSON_ArrayForEach(alert, alerts_map) {
         int code = cJSON_GetObjectItem(alert, "code")->valueint;
@@ -192,22 +202,26 @@ int main(int argc, char **argv) {
     }
 
     char *json_raw = read_file("rs_xx9.json");
+    if (!json_raw) {
+        printf("Erro ao ler arquivo JSON!\n");
+        return 1;
+    }
     cJSON *root = cJSON_Parse(json_raw);
     cJSON *amp_table = cJSON_GetObjectItem(root, "amplifier_table");
 
     init_snmp_session(argv[1]);
 
-    // 1. Processa Globais (Potência Total)
+    // 1. Globais
     process_globals(root);
 
-    // 2. Discovery de Gavetas
+    // 2. Discovery
     int discovery_list[32];
     const char *oid_temp_base = cJSON_GetObjectItem(amp_table, "base_oid_temp")->valuestring;
     int total_found = discover_amplifiers(oid_temp_base, discovery_list);
 
     printf("\nJUPITER: %d amplificadores localizados.\n", total_found);
 
-    // 3. Loop por Gaveta
+    // 3. Loop
     for (int i = 0; i < total_found; i++) {
         process_amplifier(discovery_list[i], amp_table);
     }
