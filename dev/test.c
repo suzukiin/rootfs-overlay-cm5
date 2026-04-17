@@ -12,11 +12,12 @@ int discover_amplifiers(const char *base_oid_str, int *found_ids);
 int get_snmp_int(const char *oid_str);
 const char* translate_status(int val);
 void process_amplifier(int amp_id, cJSON *amp_table);
+void process_globals(cJSON *root);
 
 // --- GLOBAIS ---
 struct snmp_session session, *ss;
 
-// --- TRADUTOR DE STATUS (Conforme seu documento R&S) ---
+// --- TRADUTOR DE STATUS ---
 const char* translate_status(int val) {
     switch(val) {
         case 2: return "OFF/NORMAL";
@@ -24,7 +25,7 @@ const char* translate_status(int val) {
         case 4: return "WARNING";
         case 5: return "OK/ON";
         case -1: return "TIMEOUT/NETWORK ERROR";
-        case -2: return "OID NOT FOUND (INDEX ERROR)";
+        case -2: return "INDEX ERROR/TYPE MISMATCH";
         default: return "UNDEFINED";
     }
 }
@@ -53,7 +54,7 @@ void init_snmp_session(const char *ip) {
     session.version = SNMP_VERSION_2c;
     session.community = (u_char *)"public";
     session.community_len = strlen((const char *)session.community);
-    session.timeout = 1000000; // 1 segundo
+    session.timeout = 1500000; // 1.5 segundos
     session.retries = 1;
 
     ss = snmp_open(&session);
@@ -61,6 +62,36 @@ void init_snmp_session(const char *ip) {
         snmp_sess_perror("Erro Crítico SNMP", &session);
         exit(1);
     }
+}
+
+// --- BUSCA VALOR (BLINDADA) ---
+int get_snmp_int(const char *oid_str) {
+    struct snmp_pdu *pdu, *response = NULL;
+    oid an_oid[MAX_OID_LEN];
+    size_t an_oid_len = MAX_OID_LEN;
+    int val = -1;
+
+    if (!snmp_parse_oid(oid_str, an_oid, &an_oid_len)) return -1;
+
+    pdu = snmp_pdu_create(SNMP_MSG_GET);
+    snmp_add_null_var(pdu, an_oid, an_oid_len);
+
+    int status = snmp_synch_response(ss, pdu, &response);
+
+    if (status == STAT_SUCCESS && response != NULL) {
+        if (response->errstat == SNMP_ERR_NOERROR && response->variables != NULL) {
+            u_char type = response->variables->type;
+            // R&S pode retornar Integers ou Gauges para temperatura/potência
+            if (type == ASN_INTEGER || type == ASN_GAUGE || type == ASN_COUNTER || type == ASN_TIMETICKS) {
+                val = (int)*response->variables->val.integer;
+            } else {
+                val = -2; 
+            }
+        }
+    }
+
+    if (response) snmp_free_pdu(response);
+    return val;
 }
 
 // --- DESCOBERTA DE GAVETAS ---
@@ -82,6 +113,7 @@ int discover_amplifiers(const char *base_oid_str, int *found_ids) {
         if (status == STAT_SUCCESS && response && response->errstat == SNMP_ERR_NOERROR) {
             struct variable_list *vars = response->variables;
             if (vars && snmp_oid_compare(root_oid, root_oid_len, vars->name, root_oid_len) == 0) {
+                // Pega o ID (normalmente o último dígito)
                 int id = vars->name[vars->name_length - 1];
                 found_ids[count++] = id;
                 memcpy(current_oid, vars->name, vars->name_length * sizeof(oid));
@@ -99,59 +131,52 @@ int discover_amplifiers(const char *base_oid_str, int *found_ids) {
     return count;
 }
 
-// --- BUSCA VALOR (BLINDADA) ---
-int get_snmp_int(const char *oid_str) {
-    struct snmp_pdu *pdu, *response = NULL;
-    oid an_oid[MAX_OID_LEN];
-    size_t an_oid_len = MAX_OID_LEN;
-    int val = -1;
+// --- MÉTRICAS GLOBAIS (POTÊNCIA TOTAL) ---
+void process_globals(cJSON *root) {
+    cJSON *globals = cJSON_GetObjectItem(root, "global_metrics");
+    cJSON *metric = NULL;
 
-    if (!snmp_parse_oid(oid_str, an_oid, &an_oid_len)) return -1;
-
-    pdu = snmp_pdu_create(SNMP_MSG_GET);
-    snmp_add_null_var(pdu, an_oid, an_oid_len);
-
-    int status = snmp_synch_response(ss, pdu, &response);
-
-    if (status == STAT_SUCCESS && response != NULL) {
-        if (response->errstat == SNMP_ERR_NOERROR && response->variables != NULL) {
-            u_char type = response->variables->type;
-            // Se o tipo for 0x81 ou 0x80, é um erro de "No Such Instance"
-            if (type == ASN_INTEGER || type == ASN_GAUGE || type == ASN_COUNTER) {
-                val = (int)*response->variables->val.integer;
-            } else {
-                val = -2; // Erro de instância/tipo
-            }
-        }
+    printf("\n>>> MÉTRICAS GLOBAIS DO TRANSMISSOR\n");
+    cJSON_ArrayForEach(metric, globals) {
+        const char *name = cJSON_GetObjectItem(metric, "name")->valuestring;
+        const char *oid = cJSON_GetObjectItem(metric, "oid")->valuestring;
+        
+        int val = get_snmp_int(oid);
+        printf("  %-18s: %d\n", name, val);
     }
-
-    if (response) snmp_free_pdu(response);
-    return val;
 }
 
-// --- PROCESSA GAVETA (CORREÇÃO DE ÍNDICE) ---
+// --- PROCESSA GAVETA ---
 void process_amplifier(int amp_id, cJSON *amp_table) {
     const char *base_status_oid = cJSON_GetObjectItem(amp_table, "alerts_base_oid")->valuestring;
     const char *base_temp_oid = cJSON_GetObjectItem(amp_table, "base_oid_temp")->valuestring;
     cJSON *alerts_map = cJSON_GetObjectItem(amp_table, "alerts_map");
     cJSON *alert = NULL;
 
-    printf("\n>>> ANALISANDO GAVETA ID: %d\n", amp_id);
+    printf("\n======================================\n");
+    printf(" ANALISANDO GAVETA ID: %d\n", amp_id);
+    printf("======================================\n");
 
-    // 1. Leitura de Temperatura (Agnóstica)
+    // 1. Leitura de Temperatura (Ajustada com prefixo .1.1 para bater com a tabela)
     char temp_oid_full[256];
-    snprintf(temp_oid_full, sizeof(temp_oid_full), "%s.%d", base_temp_oid, amp_id);
+    snprintf(temp_oid_full, sizeof(temp_oid_full), "%s.1.1.%d", base_temp_oid, amp_id);
     int temp = get_snmp_int(temp_oid_full);
+    
+    if (temp < 0) {
+        // Tenta o formato simples caso o .1.1 falhe
+        snprintf(temp_oid_full, sizeof(temp_oid_full), "%s.%d", base_temp_oid, amp_id);
+        temp = get_snmp_int(temp_oid_full);
+    }
+    
     printf("  [MEDIDA] Temperatura: %d C\n", temp);
 
-    // 2. Leitura de Alertas (Ajustada para o padrão R&S: BASE.1.1.ID.CODE)
+    // 2. Leitura de Alertas (Padrão que funcionou: BASE.1.1.ID.CODE)
     printf("  [STATUS] Verificando Alertas...\n");
     cJSON_ArrayForEach(alert, alerts_map) {
         int code = cJSON_GetObjectItem(alert, "code")->valueint;
         const char *label = cJSON_GetObjectItem(alert, "label")->valuestring;
         
         char full_oid[256];
-        // TENTATIVA: Movendo o ID para a posição correta conforme manual R&S
         snprintf(full_oid, sizeof(full_oid), "%s.1.1.%d.%d", base_status_oid, amp_id, code);
         
         int status_val = get_snmp_int(full_oid);
@@ -172,12 +197,17 @@ int main(int argc, char **argv) {
 
     init_snmp_session(argv[1]);
 
+    // 1. Processa Globais (Potência Total)
+    process_globals(root);
+
+    // 2. Discovery de Gavetas
     int discovery_list[32];
-    const char *oid_temp = cJSON_GetObjectItem(amp_table, "base_oid_temp")->valuestring;
-    int total_found = discover_amplifiers(oid_temp, discovery_list);
+    const char *oid_temp_base = cJSON_GetObjectItem(amp_table, "base_oid_temp")->valuestring;
+    int total_found = discover_amplifiers(oid_temp_base, discovery_list);
 
-    printf("JUPITER: %d amplificadores localizados.\n", total_found);
+    printf("\nJUPITER: %d amplificadores localizados.\n", total_found);
 
+    // 3. Loop por Gaveta
     for (int i = 0; i < total_found; i++) {
         process_amplifier(discovery_list[i], amp_table);
     }
